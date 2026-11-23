@@ -14,7 +14,6 @@
 (define-derived-mode run-code-output-mode special-mode "Run-Code"
   "Major mode for run-code process output."
   ;; Output buffers are transient panels, not source buffers.
-  (define-key run-code-output-mode-map (kbd "q") #'quit-window)
   ;; Also disable line numbers if a global mode enables them later.
   (add-hook 'display-line-numbers-mode-hook
             #'run-code--disable-output-line-numbers nil t)

@@ -6,9 +6,7 @@
   (evil-define-key 'normal run-code-mode-map
     (kbd "r") #'run-code-dev
     (kbd "R") #'run-code-opt
-    (kbd "t") #'run-code-test)
-  (evil-define-key 'normal run-code-output-mode-map
-    (kbd "q") #'quit-window))
+    (kbd "t") #'run-code-test))
 
 (provide 'run-code-evil)
 ;;; run-code-evil.el ends here
