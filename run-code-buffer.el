@@ -52,6 +52,7 @@
                (processp run-code-buffer-process)
                (process-live-p run-code-buffer-process))
       (delete-process run-code-buffer-process))
+    (run-code--configure-output-font-lock source)
     (let ((inhibit-read-only t))
       (when run-code-buffer-clear (erase-buffer))
       (goto-char (point-max))
@@ -68,6 +69,45 @@
     (unless buffer (user-error "No run-code output buffer exists"))
     (when-let* ((window (get-buffer-window buffer)))
       (delete-window window))))
+
+(defconst run-code--lean-font-lock-keywords
+  '(("^\\(Run-code\\|Directory\\):" (1 'font-lock-comment-face))
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(error\\):"
+     (1 'shadow) (2 'error))
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(warning\\):"
+     (1 'shadow) (2 'warning))
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(info\\):"
+     (1 'shadow) (2 'success))
+    ("^\\[run-code\\] Failed.*$" . 'error)
+    ("^\\[run-code\\] Finished.*$" . 'success)
+    ("^Process .* finished$" . 'shadow)
+    ("^── .* ──$" . 'font-lock-preprocessor-face)
+    ("^\\(theorem\\|ctor\\|def\\|axiom\\|opaque\\|variable\\)\\_>\\s-+\\([^ \t\n:]+\\)"
+     (1 'font-lock-keyword-face)
+     (2 'font-lock-function-name-face))
+    ("^\\(sorry\\)\\_>\\s-+\\([^ \t\n:]+\\)"
+     (1 'warning)
+     (2 'font-lock-function-name-face))
+    ("^⊢" . 'warning)
+    ("\\_<\\(forall\\|exists\\|fun\\|let\\|in\\|if\\|then\\|else\\|match\\|with\\|by\\|sorry\\)\\_>"
+     . 'font-lock-keyword-face)
+    ("\\_<\\(Nat\\|Int\\|Bool\\|Prop\\|Type\\|Sort\\|String\\|List\\|Option\\|True\\|False\\|Fin\\|Unit\\)\\_>"
+     . 'font-lock-type-face)
+    ("[∀∃→↔∧∨¬⊢≤≥≠∣×∑∏]" . 'font-lock-builtin-face)
+    ("\\_<[0-9]+\\_>" . 'font-lock-constant-face))
+  "Font-lock keywords for Lean output in `run-code-output-mode'.")
+
+(defun run-code--configure-output-font-lock (source)
+  "Configure syntax highlighting in the current output buffer for SOURCE."
+  (if (with-current-buffer source (derived-mode-p 'lean4-mode))
+      (progn
+        (setq-local font-lock-defaults '(run-code--lean-font-lock-keywords t))
+        (setq-local font-lock-set-defaults nil)
+        (font-lock-mode 1))
+    (kill-local-variable 'font-lock-defaults)
+    (setq-local font-lock-set-defaults nil)
+    (when (bound-and-true-p font-lock-mode)
+      (font-lock-mode -1))))
 
 (provide 'run-code-buffer)
 ;;; run-code-buffer.el ends here
