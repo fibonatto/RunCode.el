@@ -1,82 +1,176 @@
 ;;; run-code-language.el --- Language command registry -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
-(require 'seq)
 (require 'run-code-config)
 (require 'run-code-utils)
 
+(defvar run-code-language-registry nil
+  "Alist mapping major-mode symbols to property plists.
+Supported properties: :dev, :opt, :test, :font-lock.")
+
+(defun run-code-register-language (modes &rest properties)
+  "Register MODES (a symbol or list of symbols) with PROPERTIES."
+  (unless (and properties (keywordp (car properties)))
+    (error "Invalid language registration for %S" modes))
+  (dolist (mode (if (listp modes) modes (list modes)))
+    (unless (symbolp mode)
+      (error "Mode must be a symbol: %S" mode))
+    (let ((entry (assq mode run-code-language-registry)))
+      (if entry
+          (setcdr entry properties)
+        (push (cons mode properties) run-code-language-registry))))
+  modes)
+
+(defun run-code--registered-property (mode property)
+  (plist-get (cdr (assq mode run-code-language-registry)) property))
+
+(defun run-code--resolve-command-value (value)
+  (if (functionp value) (funcall value) value))
+
+(defun run-code--get-command (operation)
+  (let* ((mode major-mode)
+         (prop (pcase operation
+                 ('dev :dev)
+                 ('opt :opt)
+                 ('test :test)))
+         (custom (if (eq operation 'test)
+                     (alist-get mode run-code-test-commands)
+                   (alist-get mode run-code-commands)))
+         (registered (run-code--registered-property mode prop)))
+    (run-code--resolve-command-value (or custom registered))))
+
+(defun run-code--has-command-p (mode)
+  (or (assq mode run-code-language-registry)
+      (assq mode run-code-commands)
+      (assq mode run-code-test-commands)))
+
+(defun run-code-supported-languages ()
+  "Return a sorted list of supported major-mode symbols."
+  (sort (delete-dups
+         (append (mapcar #'car run-code-language-registry)
+                 (mapcar #'car run-code-commands)
+                 (mapcar #'car run-code-test-commands)))
+        (lambda (a b) (string< (symbol-name a) (symbol-name b)))))
+
+;;; Project & Environment Helpers
+
+(defun run-code--project-root-p (&rest markers)
+  "Return dominating directory containing any file in MARKERS."
+  (locate-dominating-file
+   (run-code--file-directory)
+   (lambda (dir)
+     (cl-some (lambda (m) (file-readable-p (expand-file-name m dir)))
+              markers))))
+
+(defun run-code--temp-binary ()
+  "Return a unique temporary executable path in `run-code-temp-dir'."
+  (shell-quote-argument
+   (expand-file-name (format "run-code-%d" (emacs-pid)) run-code-temp-dir)))
+
+;;; Language Command Builders
+
+(defun run-code--c-command (&optional optimized)
+  (if (run-code--project-root-p "Makefile" "makefile" "GNUmakefile")
+      (if optimized "make" "make run")
+    (let ((bin (run-code--temp-binary))
+          (flags (if optimized "-O2 -Wall -Wextra" "-O0 -g -Wall -Wextra")))
+      (format "clang %s %% -o %s && %s; rc=$?; rm -f %s; exit $rc"
+              flags bin bin bin))))
+
+(defun run-code--cpp-command (&optional optimized)
+  (if (run-code--project-root-p "Makefile" "makefile" "GNUmakefile")
+      (if optimized "make" "make run")
+    (let ((bin (run-code--temp-binary))
+          (flags (if optimized "-std=c++17 -O2 -Wall -Wextra" "-std=c++17 -O0 -g -Wall -Wextra"))
+          (llvm (if (string-match-p "#include[[:space:]]*[<\\\"]llvm/" (run-code--buffer-text))
+                    " $(llvm-config --cxxflags --ldflags --system-libs --libs all)"
+                  "")))
+      (format "clang++ %s %%%s -o %s && %s; rc=$?; rm -f %s; exit $rc"
+              flags llvm bin bin bin))))
+
+(defun run-code--rust-command (&optional optimized)
+  (if (run-code--project-root-p "Cargo.toml")
+      (if optimized "cargo run --release" "cargo run")
+    (let ((bin (run-code--temp-binary))
+          (flags (if optimized "-O" "-g")))
+      (format "rustc %s %% -o %s && %s; rc=$?; rm -f %s; exit $rc"
+              flags bin bin bin))))
+
+(defun run-code--haskell-command (&optional optimized)
+  (cond
+   ((run-code--project-root-p "stack.yaml")
+    (if optimized "stack run --ghc-options=-O2" "stack run"))
+   ((run-code--project-root-p "package.yaml")
+    (if optimized "cabal run -O2" "cabal run"))
+   (t
+    (let ((bin (run-code--temp-binary))
+          (dir (shell-quote-argument run-code-temp-dir))
+          (flags (if optimized "-O2 -threaded" "-O0")))
+      (format "ghc %s -outputdir %s %% -o %s && %s; rc=$?; rm -f %s; exit $rc"
+              flags dir bin bin bin)))))
+
+(defun run-code--typescript-opt-command ()
+  (let ((dir (shell-quote-argument run-code-temp-dir)))
+    (format "tsc %% --outDir %s && node %s/%%:t:r.js" dir dir)))
+
 (defun run-code--python-venv-executable (directory)
-  (cl-loop for executable in '("python" "python3")
-           for path = (expand-file-name (concat "bin/" executable) directory)
+  (cl-loop for exe in '("python" "python3")
+           for path = (expand-file-name (concat "bin/" exe) directory)
            when (file-executable-p path) return path))
 
 (defun run-code--find-project-python-venv ()
-  (let ((directory (file-name-as-directory (expand-file-name (run-code--file-directory))))
-        executable)
-    (while (and directory (not executable))
-      (setq executable
+  (let ((dir (file-name-as-directory (expand-file-name (run-code--file-directory))))
+        found)
+    (while (and dir (not found))
+      (setq found
             (cl-loop for name in run-code-python-venv-directories
-                     for path = (expand-file-name name directory)
+                     for path = (expand-file-name name dir)
                      when (file-directory-p path)
                      thereis (run-code--python-venv-executable path)))
-      (unless executable
-        (let ((parent (file-name-directory (directory-file-name directory))))
-          (setq directory (unless (or (null parent) (equal parent directory)) parent)))))
-    executable))
+      (unless found
+        (let ((parent (file-name-directory (directory-file-name dir))))
+          (setq dir (unless (or (null parent) (equal parent directory)) parent)))))
+    found))
 
 (defun run-code--python-executable ()
   (let* ((venv (getenv "VIRTUAL_ENV"))
          (active (and venv (file-directory-p venv)
                       (run-code--python-venv-executable venv))))
-    (or active (run-code--find-project-python-venv)
-        (executable-find "python3") (executable-find "python")
+    (or active
+        (run-code--find-project-python-venv)
+        (executable-find "python3")
+        (executable-find "python")
         (user-error "Python interpreter not found"))))
 
-(defun run-code--python-command (&optional optimized test)
+(defun run-code--python-command (&optional mode)
   (concat (shell-quote-argument (run-code--python-executable))
-          (cond (test " -m pytest")
-                (optimized " -O %")
-                (t " -u %"))))
-
-(defun run-code--lean-project-p ()
-  (locate-dominating-file
-   (run-code--file-directory)
-   (lambda (dir) (or (file-readable-p (expand-file-name "lakefile.lean" dir))
-                     (file-readable-p (expand-file-name "lakefile.toml" dir))))))
+          (pcase mode
+            ('test " -m pytest")
+            ('opt  " -O %")
+            (_     " -u %"))))
 
 (defun run-code--lean-check-command ()
-  "Check Lean types and display useful, categorized declarations."
-  (let ((lean-command
-         (if (run-code--lean-project-p)
-             "lake env lean"
-           "lean")))
+  "Check Lean types and display categorized local declarations."
+  (let ((lean-cmd (if (run-code--project-root-p "lakefile.lean" "lakefile.toml")
+                      "lake env lean"
+                    "lean")))
     (concat
      "tmpdir=$(mktemp -d \"%:h/.run-code.XXXXXX\") || exit 1\n"
      "tmp=\"$tmpdir/Context.lean\"\n"
      "trap 'rm -rf \"$tmpdir\"' EXIT\n"
      "{ echo 'import Lean'; cat %; } > \"$tmp\" || exit 1\n"
-     "cat >> \"$tmp\" <<'RUN_CODE_LEAN_CONTEXT'\n"
-     "\n"
-     "open Lean Elab Command Meta\n"
-     "\n"
+     "cat >> \"$tmp\" <<'RUN_CODE_LEAN_CONTEXT'\n\n"
+     "open Lean Elab Command Meta\n\n"
      "run_cmd do\n"
      "  let isInternal (name : Name) : Bool := Id.run do\n"
      "    let s := name.toString\n"
      "    let last := (s.splitOn \".\").getLast!\n"
      "    last ∈ [\"rec\", \"casesOn\", \"recOn\", \"brecOn\", \"binductionOn\",\n"
-     "            \"below\", \"ibelow\",\n"
-     "            \"noConfusion\", \"noConfusionType\", \"ctorIdx\",\n"
-     "            \"ctorElim\", \"ctorElimType\", \"elim\",\n"
-     "            \"inj\", \"injEq\", \"sizeOf_spec\",\n"
-     "            \"_f\", \"_unsafe_rec\", \"_sunfold\"] ||\n"
-     "    last.startsWith \"match_\" ||\n"
-     "    last.startsWith \"eq_\" ||\n"
-     "    last.startsWith \"proof_\" ||\n"
-     "    s.contains \".brecOn.\" ||\n"
-     "    s.contains \".below.\" ||\n"
-     "    s.contains \".ibelow.\" ||\n"
-     "    s.contains \"._\"\n"
-     "\n"
+     "            \"below\", \"ibelow\", \"noConfusion\", \"noConfusionType\",\n"
+     "            \"ctorIdx\", \"ctorElim\", \"ctorElimType\", \"elim\",\n"
+     "            \"inj\", \"injEq\", \"sizeOf_spec\", \"_f\", \"_unsafe_rec\", \"_sunfold\"] ||\n"
+     "    last.startsWith \"match_\" || last.startsWith \"eq_\" || last.startsWith \"proof_\" ||\n"
+     "    s.contains \".brecOn.\" || s.contains \".below.\" || s.contains \".ibelow.\" || s.contains \"._\"\n\n"
      "  let unfoldProps (propDefs : NameSet) (e : Expr) : CoreM Expr := do\n"
      "    let env ← getEnv\n"
      "    Core.transform e fun sub => do\n"
@@ -87,34 +181,27 @@
      "            if let some val := ci.value? then\n"
      "              return .visit (val.instantiateLevelParams ci.levelParams lvls)\n"
      "        return .continue\n"
-     "      | _ => return .continue\n"
-     "\n"
+     "      | _ => return .continue\n\n"
      "  let renderDecl (header : String) (fmt : Format) (maxW : Nat := 60) : MessageData :=\n"
      "    let single := fmt.pretty (width := maxW) (indent := 2) (column := header.length + 1)\n"
      "    if single.contains '\\n' || header.length + 1 + single.length > maxW then\n"
      "      let multi := fmt.pretty (width := maxW) (indent := 2) (column := 2)\n"
      "      MessageData.ofFormat (Format.text s!\"{header}\\n  {multi}\")\n"
      "    else\n"
-     "      MessageData.ofFormat (Format.text s!\"{header} {single}\")\n"
-     "\n"
+     "      MessageData.ofFormat (Format.text s!\"{header} {single}\")\n\n"
      "  let env ← getEnv\n"
      "  let infos ← liftIO <| env.getLocalConstantInfos (skipTheoremSubDecls := true)\n"
-     "\n"
      "  let mut propDefs : NameSet := {}\n"
      "  for info in infos do\n"
      "    unless isInternal info.name do\n"
-     "      match info.toConstantInfo with\n"
-     "      | .defnInfo val =>\n"
+     "      if let .defnInfo val := info.toConstantInfo then\n"
      "        if val.type == Expr.sort Level.zero && val.safety != .partial then\n"
-     "          propDefs := propDefs.insert info.name\n"
-     "      | _ => pure ()\n"
-     "\n"
+     "          propDefs := propDefs.insert info.name\n\n"
      "  let mut thms : Array MessageData := #[]\n"
      "  let mut openGoals : Array MessageData := #[]\n"
      "  let mut ctors : Array MessageData := #[]\n"
      "  let mut defs : Array MessageData := #[]\n"
-     "  let mut axioms : Array MessageData := #[]\n"
-     "\n"
+     "  let mut axioms : Array MessageData := #[]\n\n"
      "  for info in infos do\n"
      "    unless isInternal info.name do\n"
      "      match info.toConstantInfo with\n"
@@ -124,216 +211,138 @@
      "          let fmt ← ppExpr ty\n"
      "          let header := if val.value.hasSorry then s!\"sorry {info.name} :\" else s!\"theorem {info.name} :\"\n"
      "          pure (renderDecl header fmt)\n"
-     "        if val.value.hasSorry then\n"
-     "          openGoals := openGoals.push msg\n"
-     "        else\n"
-     "          thms := thms.push msg\n"
+     "        if val.value.hasSorry then openGoals := openGoals.push msg else thms := thms.push msg\n"
      "      | .ctorInfo val =>\n"
      "        let msg ← liftTermElabM do\n"
      "          let ty ← Core.betaReduce (← unfoldProps propDefs val.type)\n"
-     "          let fmt ← ppExpr ty\n"
-     "          pure (renderDecl s!\"ctor {info.name} :\" fmt)\n"
+     "          pure (renderDecl s!\"ctor {info.name} :\" (← ppExpr ty))\n"
      "        ctors := ctors.push msg\n"
      "      | .defnInfo val =>\n"
      "        unless propDefs.contains info.name do\n"
      "          let last := (info.name.toString.splitOn \".\").getLast!\n"
      "          unless last.endsWith \"Aux\" || last.endsWith \"_aux\" do\n"
      "            let msg ← liftTermElabM do\n"
-     "              let fmt ← ppExpr val.type\n"
-     "              pure (renderDecl s!\"def {info.name} :\" fmt)\n"
+     "              pure (renderDecl s!\"def {info.name} :\" (← ppExpr val.type))\n"
      "            defs := defs.push msg\n"
      "      | .axiomInfo val =>\n"
      "        let msg ← liftTermElabM do\n"
      "          let ty ← Core.betaReduce (← unfoldProps propDefs val.type)\n"
-     "          let fmt ← ppExpr ty\n"
-     "          pure (renderDecl s!\"axiom {info.name} :\" fmt)\n"
+     "          pure (renderDecl s!\"axiom {info.name} :\" (← ppExpr ty))\n"
      "        axioms := axioms.push msg\n"
      "      | .opaqueInfo val =>\n"
      "        let msg ← liftTermElabM do\n"
      "          let ty ← Core.betaReduce (← unfoldProps propDefs val.type)\n"
-     "          let fmt ← ppExpr ty\n"
-     "          pure (renderDecl s!\"opaque {info.name} :\" fmt)\n"
+     "          pure (renderDecl s!\"opaque {info.name} :\" (← ppExpr ty))\n"
      "        axioms := axioms.push msg\n"
-     "      | .inductInfo _ | .recInfo _ | .quotInfo _ => pure ()\n"
-     "\n"
+     "      | _ => pure ()\n\n"
      "  let logSection (title : String) (items : Array MessageData) : CommandElabM Unit := do\n"
      "    unless items.isEmpty do\n"
-     "      let body := MessageData.joinSep items.toList m!\"\\n\"\n"
-     "      logInfo m!\"── {title} ──\\n{body}\"\n"
-     "\n"
+     "      logInfo m!\"── {title} ──\\n{MessageData.joinSep items.toList m!\"\\n\"}\"\n\n"
      "  logSection \"THEOREMS\" thms\n"
      "  logSection \"CONSTRUCTORS\" ctors\n"
      "  logSection \"OPEN GOALS (sorry)\" openGoals\n"
      "  logSection \"AXIOMS / OPAQUE\" axioms\n"
-     "  logSection \"DEFINITIONS\" defs\n"
-     "\n"
+     "  logSection \"DEFINITIONS\" defs\n\n"
      "  let activeVars ← runTermElabM fun xs => do\n"
      "    let mut vars : Array MessageData := #[]\n"
      "    for x in xs do\n"
-     "      let name ← ppExpr x\n"
-     "      let type ← ppExpr (← inferType x)\n"
-     "      vars := vars.push m!\"variable {name} : {type}\"\n"
+     "      vars := vars.push m!\"variable {← ppExpr x} : {← ppExpr (← inferType x)}\"\n"
      "    pure vars\n"
      "  logSection \"ACTIVE VARIABLES\" activeVars\n"
-     "\n"
      "RUN_CODE_LEAN_CONTEXT\n"
-     lean-command " \"$tmp\"")))
+     lean-cmd " \"$tmp\"")))
 
-(defun run-code--c-command ()
-  (if (run-code--makefile-p) "make run"
-    (concat "clang %" (if (string-match-p "#include[[:space:]]*<cs50\\.h>" (run-code--buffer-text))
-                          " -I/usr/local/include -L/usr/local/lib -lcs50" "")
-            " -o %:r && ./%:r")))
+;;; Language Registrations
 
-(defun run-code--c-opt-command ()
-  (if (run-code--makefile-p) "make && ./$(basename %:r)"
-    (concat "clang -O2 %" (if (string-match-p "#include[[:space:]]*<cs50\\.h>" (run-code--buffer-text))
-                                " -I/usr/local/include -L/usr/local/lib -lcs50" "")
-            " -o %:r && ./%:r")))
+;; Primary languages
+(run-code-register-language
+ '(c-mode c-ts-mode)
+ :dev  (lambda () (run-code--c-command nil))
+ :opt  (lambda () (run-code--c-command t))
+ :test "make test")
 
-(defun run-code--cpp-command (&optional optimized)
-  (concat "clang++ -std=c++17" (if optimized " -O2" "") " %"
-          (if (string-match-p "#include[[:space:]]*[<\\\"]llvm/" (run-code--buffer-text))
-              " $(llvm-config --cxxflags --ldflags --system-libs --libs all)" "")
-          " -o %:r && ./%:r"))
+(run-code-register-language
+ '(c++-mode c++-ts-mode)
+ :dev  (lambda () (run-code--cpp-command nil))
+ :opt  (lambda () (run-code--cpp-command t))
+ :test "make test")
 
-(defun run-code--haskell-opt-command ()
-  (let ((exe (expand-file-name (format ".run_code_%d" (emacs-pid)) run-code-temp-dir)))
-    (format "ghc -O2 -threaded %% -o %s && %s; rc=$?; rm -f %s %%:r.hi %%:r.o; exit $rc"
-            (shell-quote-argument exe) (shell-quote-argument exe)
-            (shell-quote-argument exe))))
+(run-code-register-language
+ '(rust-mode rust-ts-mode)
+ :dev  (lambda () (run-code--rust-command nil))
+ :opt  (lambda () (run-code--rust-command t))
+ :test "cargo test"
+ :font-lock 'run-code--rust-font-lock-keywords)
 
-(defun run-code--typescript-opt-command ()
-  (concat "tsc % --outDir " (shell-quote-argument run-code-temp-dir)
-          " && node " (shell-quote-argument run-code-temp-dir) "/%:t:r.js"))
+(run-code-register-language
+ '(haskell-mode haskell-ts-mode)
+ :dev  (lambda () (run-code--haskell-command nil))
+ :opt  (lambda () (run-code--haskell-command t))
+ :test "stack test")
 
-(defconst run-code-development-commands
-  '(("agda-mode" . "agda-cli check %") ("bend-mode" . "bend %")
-    ("c-mode" . run-code--c-command) ("c-ts-mode" . run-code--c-command)
-    ("c++-mode" . (lambda () (run-code--cpp-command nil)))
-    ("c++-ts-mode" . (lambda () (run-code--cpp-command nil)))
-    ("caramel-mode" . "mel main") ("coc-mode" . "coc type %:r && coc norm %:r")
-    ("csharp-mode" . "mcs % -out:%:r.exe && mono %:r.exe")
-    ("cuda-mode" . "nvcc % -o %:r && ./%:r") ("dart-mode" . "dart %")
-    ("dvl-mode" . "dvl run %") ("elm-mode" . "elm make % --output=%:r.js")
-    ("erlang-mode" . "escript %") ("go-mode" . "go run %")
-    ("haskell-mode" . "stack run") ("html-mode" . "npm run dev")
-    ("lean4-mode" . run-code--lean-check-command) ("mhtml-mode" . "npm run dev")
-    ("http-mode" . "httpyac --all route.http") ("java-mode" . "javac % && java -cp %:h %:t:r")
-    ("js-mode" . "bun run %") ("js-ts-mode" . "bun run %")
-    ("lisp-mode" . "sbcl --script %") ("typescript-mode" . "bun run %")
-    ("typescript-ts-mode" . "bun run %") ("julia-mode" . "julia %")
-    ("kotlin-mode" . "kotlinc % -include-runtime -d %:r.jar && java -jar %:r.jar")
-    ("lua-mode" . "lua %") ("nim-mode" . "nim compile --run %")
-    ("ocaml-mode" . "ocamlc -o %:r % && ./%:r") ("perl-mode" . "perl -w %")
-    ("php-mode" . "php %") ("python-mode" . run-code--python-command)
-    ("python-ts-mode" . run-code--python-command) ("r-mode" . "Rscript %")
-    ("ruby-mode" . "ruby %") ("rust-mode" . "rustc -O % -o %:r && ./%:r")
-    ("rust-ts-mode" . "rustc -O % -o %:r && ./%:r") ("scala-mode" . "scala %")
-    ("scheme-mode" . "csc % && ./%:r") ("sh-mode" . "bash -x %")
-    ("swift-mode" . "swift %") ("web-mode" . "npm run dev")
-    ("zig-mode" . "zig run %")))
+(run-code-register-language
+ '(js-mode js-ts-mode)
+ :dev  "bun run %"
+ :opt  "node %"
+ :test "bun test")
 
-(defconst run-code-optimized-commands
-  '(("agda-mode" . "agda-cli run %") ("bend-mode" . "bend %")
-    ("c-mode" . run-code--c-opt-command) ("c-ts-mode" . run-code--c-opt-command)
-    ("c++-mode" . (lambda () (run-code--cpp-command t)))
-    ("c++-ts-mode" . (lambda () (run-code--cpp-command t)))
-    ("cuda-mode" . "nvcc -O3 % -o %:r && ./%:r")
-    ("dart-mode" . "dart compile exe % -o %:r && ./%:r")
-    ("go-mode" . "go build -ldflags=\"-s -w\" -o %:r % && ./%:r")
-    ("haskell-mode" . run-code--haskell-opt-command)
-    ("html-mode" . "python3 -m http.server 8000")
-    ("mhtml-mode" . "python3 -m http.server 8000")
-    ("java-mode" . "javac % && java -server -XX:+UseG1GC -cp %:h %:t:r")
-    ("js-mode" . "node %") ("js-ts-mode" . "node %")
-    ("julia-mode" . "julia -O3 %")
-    ("kotlin-mode" . "kotlinc % -include-runtime -d %:r.jar && java -server -jar %:r.jar")
-    ("lean4-mode" . run-code--lean-check-command) ("lisp-mode" . "sbcl --script %")
-    ("nim-mode" . "nim compile --opt:speed --run %")
-    ("ocaml-mode" . "ocamlopt -O3 -o %:r % && ./%:r")
-    ("pascal-mode" . "fpc -O3 % && ./%:r")
-    ("python-mode" . (lambda () (run-code--python-command t)))
-    ("python-ts-mode" . (lambda () (run-code--python-command t)))
-    ("rust-mode" . "cargo run --release") ("rust-ts-mode" . "cargo run --release")
-    ("scala-mode" . "scalac % && scala -J-server %:r")
-    ("swift-mode" . "swiftc -O % -o %:r && ./%:r")
-    ("typescript-mode" . run-code--typescript-opt-command)
-    ("typescript-ts-mode" . run-code--typescript-opt-command)
-    ("zig-mode" . "zig run -O ReleaseFast %")))
+(run-code-register-language
+ '(typescript-mode typescript-ts-mode)
+ :dev  "bun run %"
+ :opt  #'run-code--typescript-opt-command
+ :test "bun test")
 
-(defconst run-code-test-commands-default
-  '(("c-mode" . "make test") ("c++-mode" . "make test")
-    ("c-ts-mode" . "make test") ("c++-ts-mode" . "make test")
-    ("dart-mode" . "dart test") ("go-mode" . "go test ./...")
-    ("haskell-mode" . "stack test") ("java-mode" . "mvn test")
-    ("js-mode" . "bun test") ("js-ts-mode" . "bun test")
-    ("julia-mode" . "julia -e 'using Pkg; Pkg.test()'")
-    ("kotlin-mode" . "gradle test") ("lean4-mode" . "lake test")
-    ("nim-mode" . "nimble test") ("ocaml-mode" . "dune test")
-    ("python-mode" . run-code--python-test-command)
-    ("python-ts-mode" . run-code--python-test-command)
-    ("rust-mode" . "cargo test") ("rust-ts-mode" . "cargo test")
-    ("scala-mode" . "sbt test") ("swift-mode" . "swift test")
-    ("typescript-mode" . "bun test") ("typescript-ts-mode" . "bun test")
-    ("zig-mode" . "zig build test")))
+(run-code-register-language
+ '(python-mode python-ts-mode)
+ :dev  (lambda () (run-code--python-command 'dev))
+ :opt  (lambda () (run-code--python-command 'opt))
+ :test (lambda () (run-code--python-command 'test))
+ :font-lock 'run-code--python-font-lock-keywords)
 
-(defun run-code--python-test-command () (run-code--python-command nil t))
+(run-code-register-language
+ 'agda-mode
+ :dev  "agda-cli check %"
+ :opt  "agda-cli run %"
+ :font-lock 'run-code--agda-font-lock-keywords)
 
-(defvar run-code-language-registry nil
-  "Registry of language definitions.")
+(run-code-register-language
+ 'lean4-mode
+ :dev  #'run-code--lean-check-command
+ :opt  #'run-code--lean-check-command
+ :test "lake test"
+ :font-lock 'run-code--lean-font-lock-keywords)
 
-(defun run-code-register-language (mode &rest properties)
-  "Register MODE with PROPERTIES.
-Supported properties are :dev, :opt, :test and :backend.
-Commands may be strings or zero-argument functions returning strings."
-  (unless (and (symbolp mode) properties (keywordp (car properties)))
-    (error "Invalid language registration for %S" mode))
-  (let ((entry (assq mode run-code-language-registry)))
-    (if entry
-        (setcdr entry properties)
-      (push (cons mode properties) run-code-language-registry)))
-  mode)
-
-(defun run-code--registered-property (mode property)
-  (plist-get (cdr (assq mode run-code-language-registry)) property))
-
-(defun run-code--resolve-command-value (value)
-  (if (functionp value) (funcall value) value))
-
-(defun run-code--get-command (operation)
-  (let* ((mode major-mode)
-         (mode-name (symbol-name mode))
-         (registered (run-code--registered-property mode (pcase operation
-                                                            ('dev :dev) ('opt :opt) ('test :test))))
-         (custom (if (eq operation 'test) (assoc-string mode-name run-code-test-commands)
-                   (assoc-string mode-name run-code-commands)))
-         (default (pcase operation
-                    ('dev (assoc-string mode-name run-code-development-commands))
-                    ('opt (assoc-string mode-name run-code-optimized-commands))
-                    ('test (assoc-string mode-name run-code-test-commands-default)))))
-    (run-code--resolve-command-value
-     (or registered (cdr custom) (cdr default)))))
-
-(defun run-code--has-command-p (mode)
-  (let ((name (symbol-name mode)))
-    (or (assq mode run-code-language-registry)
-        (assoc-string name run-code-development-commands)
-        (assoc-string name run-code-optimized-commands)
-        (assoc-string name run-code-test-commands-default)
-        (assoc-string name run-code-commands)
-        (assoc-string name run-code-test-commands))))
-
-(defun run-code-supported-languages ()
-  "Return a sorted list of supported major-mode symbols."
-  (sort (delete-dups
-         (append (mapcar (lambda (x) (intern (car x))) run-code-development-commands)
-                 (mapcar (lambda (x) (intern (car x))) run-code-optimized-commands)
-                 (mapcar (lambda (x) (intern (car x))) run-code-test-commands-default)
-                 (mapcar #'car run-code-language-registry)
-                 (mapcar (lambda (x) (intern (car x))) run-code-commands)
-                 (mapcar (lambda (x) (intern (car x))) run-code-test-commands)))
-        (lambda (a b) (string< (symbol-name a) (symbol-name b)))))
+;; Additional languages
+(run-code-register-language 'bend-mode    :dev "bend %" :opt "bend %")
+(run-code-register-language 'caramel-mode :dev "mel main")
+(run-code-register-language 'coc-mode     :dev "coc type %:r && coc norm %:r")
+(run-code-register-language 'csharp-mode  :dev "mcs % -out:%:r.exe && mono %:r.exe")
+(run-code-register-language 'cuda-mode    :dev "nvcc % -o %:r && ./%:r" :opt "nvcc -O3 % -o %:r && ./%:r")
+(run-code-register-language 'dart-mode    :dev "dart %" :opt "dart compile exe % -o %:r && ./%:r" :test "dart test")
+(run-code-register-language 'dvl-mode     :dev "dvl run %")
+(run-code-register-language 'elm-mode     :dev "elm make % --output=%:r.js")
+(run-code-register-language 'erlang-mode  :dev "escript %")
+(run-code-register-language 'go-mode      :dev "go run %" :opt "go build -ldflags=\"-s -w\" -o %:r % && ./%:r" :test "go test ./...")
+(run-code-register-language '(html-mode mhtml-mode) :dev "npm run dev" :opt "python3 -m http.server 8000")
+(run-code-register-language 'web-mode     :dev "npm run dev")
+(run-code-register-language 'http-mode    :dev "httpyac --all route.http")
+(run-code-register-language 'java-mode    :dev "javac % && java -cp %:h %:t:r" :opt "javac % && java -server -XX:+UseG1GC -cp %:h %:t:r" :test "mvn test")
+(run-code-register-language 'julia-mode   :dev "julia %" :opt "julia -O3 %" :test "julia -e 'using Pkg; Pkg.test()'")
+(run-code-register-language 'kotlin-mode  :dev "kotlinc % -include-runtime -d %:r.jar && java -jar %:r.jar" :opt "kotlinc % -include-runtime -d %:r.jar && java -server -jar %:r.jar" :test "gradle test")
+(run-code-register-language 'lisp-mode    :dev "sbcl --script %" :opt "sbcl --script %")
+(run-code-register-language 'lua-mode     :dev "lua %")
+(run-code-register-language 'nim-mode     :dev "nim compile --run %" :opt "nim compile --opt:speed --run %" :test "nimble test")
+(run-code-register-language 'ocaml-mode   :dev "ocamlc -o %:r % && ./%:r" :opt "ocamlopt -O3 -o %:r % && ./%:r" :test "dune test")
+(run-code-register-language 'pascal-mode  :opt "fpc -O3 % && ./%:r")
+(run-code-register-language 'perl-mode    :dev "perl -w %")
+(run-code-register-language 'php-mode     :dev "php %")
+(run-code-register-language 'r-mode       :dev "Rscript %")
+(run-code-register-language 'ruby-mode    :dev "ruby %")
+(run-code-register-language 'scala-mode   :dev "scala %" :opt "scalac % && scala -J-server %:r" :test "sbt test")
+(run-code-register-language 'scheme-mode  :dev "csc % && ./%:r")
+(run-code-register-language 'sh-mode      :dev "bash -x %")
+(run-code-register-language 'swift-mode   :dev "swift %" :opt "swiftc -O % -o %:r && ./%:r" :test "swift test")
+(run-code-register-language 'zig-mode     :dev "zig run %" :opt "zig run -O ReleaseFast %" :test "zig build test")
 
 (provide 'run-code-language)
 ;;; run-code-language.el ends here

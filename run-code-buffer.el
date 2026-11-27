@@ -1,6 +1,9 @@
 ;;; run-code-buffer.el --- Output buffer presentation -*- lexical-binding: t; -*-
 
 (require 'run-code-config)
+
+(require 'run-code-language)
+
 (require 'subr-x)
 
 (defvar-local run-code-buffer-process nil
@@ -70,18 +73,39 @@
     (when-let* ((window (get-buffer-window buffer)))
       (delete-window window))))
 
-(defconst run-code--lean-font-lock-keywords
+(defconst run-code--base-output-font-lock-keywords
   '(("^\\(Run-code\\|Directory\\):" (1 'font-lock-comment-face))
-    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(error\\):"
-     (1 'shadow) (2 'error))
-    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(warning\\):"
-     (1 'shadow) (2 'warning))
-    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(info\\):"
-     (1 'shadow) (2 'success))
-    ("^\\[run-code\\] Failed.*$" . 'error)
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(error\\):"   (1 'shadow) (2 'error))
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(warning\\):" (1 'shadow) (2 'warning))
+    ("^\\([^:\n]+:[0-9]+:[0-9]+:\\) \\(note\\|info\\):" (1 'shadow) (2 'success))
+    ("^\\[run-code\\] Failed.*$"   . 'error)
     ("^\\[run-code\\] Finished.*$" . 'success)
-    ("^Process .* finished$" . 'shadow)
-    ("^── .* ──$" . 'font-lock-preprocessor-face)
+    ("^Process .* finished$" . 'shadow))
+  "Base font-lock rules shared across all run-code output buffers.")
+
+(defconst run-code--rust-font-lock-keywords
+  '(("^\\(error\\(?:\\[E[0-9]+\\]\\)?\\):" (1 'error))
+    ("^\\(warning\\(?:\\[[^]]+\\]\\)?\\):" (1 'warning))
+    ("^\\s-*\\(-->\\)\\s-+\\([^:\n]+:[0-9]+:[0-9]+\\)"
+     (1 'font-lock-builtin-face) (2 'shadow))
+    ("^test .+ \\.\\.\\. \\(ok\\)$"     (1 'success))
+    ("^test .+ \\.\\.\\. \\(FAILED\\)$" (1 'error))))
+
+(defconst run-code--python-font-lock-keywords
+  '(("^\\s-*File \\(\"[^\"]+\"\\), line \\([0-9]+\\)"
+     (1 'shadow) (2 'font-lock-constant-face))
+    ("^\\([A-Za-z_][A-Za-z0-9_.]*\\(?:Error\\|Exception\\)\\):" (1 'error))
+    ("\\_<\\(PASSED\\)\\_>" (1 'success))
+    ("\\_<\\(FAILED\\|ERROR\\)\\_>" (1 'error))))
+
+(defconst run-code--agda-font-lock-keywords
+  '(("^—+$" . 'font-lock-preprocessor-face)
+    ("\\?[0-9]+\\|{![^!]*!}" . 'warning)
+    ("^\\([^:\n]+\\)\\s-+:\\s-+" (1 'font-lock-function-name-face))
+    ("[∀∃→↔λΠΣ≡≢]" . 'font-lock-builtin-face)))
+
+(defconst run-code--lean-font-lock-keywords
+  '(("^── .* ──$" . 'font-lock-preprocessor-face)
     ("^\\(theorem\\|ctor\\|def\\|axiom\\|opaque\\|variable\\)\\_>\\s-+\\([^ \t\n:]+\\)"
      (1 'font-lock-keyword-face)
      (2 'font-lock-function-name-face))
@@ -97,17 +121,25 @@
     ("\\_<[0-9]+\\_>" . 'font-lock-constant-face))
   "Font-lock keywords for Lean output in `run-code-output-mode'.")
 
+(defun run-code--language-font-lock-keywords (mode)
+  "Return language-specific font-lock keywords registered for MODE."
+  (let ((kw-sym
+         (or (run-code--registered-property mode :font-lock)
+             (cl-loop for (reg-mode . props) in run-code-language-registry
+                      when (provided-mode-derived-p mode reg-mode)
+                      return (plist-get props :font-lock)))))
+    (and kw-sym (boundp kw-sym) (symbol-value kw-sym))))
+
 (defun run-code--configure-output-font-lock (source)
-  "Configure syntax highlighting in the current output buffer for SOURCE."
-  (if (with-current-buffer source (derived-mode-p 'lean4-mode))
-      (progn
-        (setq-local font-lock-defaults '(run-code--lean-font-lock-keywords t))
-        (setq-local font-lock-set-defaults nil)
-        (font-lock-mode 1))
-    (kill-local-variable 'font-lock-defaults)
+  "Configure base and language-specific font-lock for SOURCE."
+  (let* ((source-mode (buffer-local-value 'major-mode source))
+         (lang-kws (run-code--language-font-lock-keywords source-mode))
+         (keywords (append run-code--base-output-font-lock-keywords lang-kws)))
+    (setq-local font-lock-defaults (list keywords t))
     (setq-local font-lock-set-defaults nil)
-    (when (bound-and-true-p font-lock-mode)
-      (font-lock-mode -1))))
+    (font-lock-mode 1)
+    (font-lock-set-defaults)
+    (font-lock-flush)))
 
 (provide 'run-code-buffer)
 ;;; run-code-buffer.el ends here
